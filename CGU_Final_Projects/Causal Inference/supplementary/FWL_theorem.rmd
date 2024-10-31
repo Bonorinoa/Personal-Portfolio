@@ -1,0 +1,145 @@
+---
+title: "FWL theorem - simulation proof"
+output: html_notebook
+---
+
+```{r}
+library(lmtest)
+library(tidyverse)
+library(ggplot2)
+```
+
+```{r}
+# Suppose we have outcome Y, with treatment D, observed covariates X1 and X2, and observed confounder Z
+# X1 -> Y <- X2 and X1 <- Z -> Y
+
+Z <- rnorm(1000, 50, 1) # say income var with mean income 50k
+X1 <- runif(1000, 0, 1) + Z 
+X2 <- rnorm(1000, 0, 1)
+e <- rnorm(1000, 0, 1)
+
+Y <- 2 + 3*X1 + 2.3*X2 + Z + e # this will be biased unless we control for Z
+
+ggplot(data.frame(Y, X1), aes(x=X1, y=Y)) + geom_point() + geom_smooth()
+```
+
+```{r}
+# We want to find the effect of X1 on Y
+# The simple regression will yield bias due to the confounder Z
+summary(lm(Y ~ X1))
+#plot(lm(Y ~ X1)$residuals) # the bias is hard to tell from the residuals' plot
+
+# Note how including/controlling the confounder Z gets the estimates much closer to the true value
+# It allows us to isolate the true effect of X1 on Y
+summary(lm(Y ~ X1 + Z))
+#plot(lm(Y ~ X1 + Z)$residuals)
+
+```
+
+
+The FWL theorem states that we can estimate this same regression by decomposing it into two steps, the first one being partialing out the effects of the covariate of interest.
+
+```{r}
+# OLS estimator from Y ~ X1 residuals
+X1_resid <- lm(X1 ~ Z)$residuals
+y_hat <- lm(Y ~ X1_resid-1) # substracting one takes out the intercept
+summary(y_hat)
+
+# OLS estimators from Y residuals ~ X1 residuals
+Y_resids <- lm(Y ~ Z)$residuals
+y_hat2 <- lm(Y_resids ~ X1_resid-1)
+summary(y_hat2)
+```
+
+
+Note that all three specifications yielded the same estimate (2.719). By partialling-out, we are removing the linear fit from the data and keeping only the residuals. The FWL theorem allows us to describe multivariate regressions as univariate ones, which are more tractable and intuitive. 
+
+Now suppose we want to include the second covariate X2.
+
+```{r}
+# biased
+multi_lm_bias <- lm(Y ~ X1 + X2)
+
+# unbiased
+multi_lm_unbias <- lm(Y ~ X1 + X2 + Z)
+
+# OLS estimator from Y ~ X1 residuals
+X1_resid2 <- lm(X1 ~ X2 + Z)$residuals
+multi_lm_unbias2 <- lm(Y ~ X1_resid2-1)
+
+# OLS estimators from Y residuals ~ X1 residuals
+Y_resid2 <- lm(Y ~ X2 + Z)$residuals
+multi_lm_unbias3 <- lm(Y_resid2 ~ X1_resid2-1)
+```
+
+```{r}
+# Define the summary of each model
+coef_multi_lm_bias <- coef(summary(multi_lm_bias))["X1",]
+coef_multi_lm_unbias <- coef(summary(multi_lm_unbias))["X1",]
+coef_multi_lm_unbias2 <- coef(summary(multi_lm_unbias2))["X1_resid2",]
+coef_multi_lm_unbias3 <- coef(summary(multi_lm_unbias3))["X1_resid2",]
+
+
+# Combine the results into a data frame
+results_df <- data.frame(
+  Model = c("multi_lm_bias", "multi_lm_unbias", "multi_lm_unbias2", "multi_lm_unbias3"),
+  Estimate = c(coeff_multi_lm_bias[1], coeff_multi_lm_unbias[1], coeff_multi_lm_unbias2[1], coeff_multi_lm_unbias3[1]),
+  Std_Error = c(coeff_multi_lm_bias[2], coeff_multi_lm_unbias[2], coeff_multi_lm_unbias2[2], coeff_multi_lm_unbias3[2]),
+  t_value = c(coeff_multi_lm_bias[3], coeff_multi_lm_unbias[3], coeff_multi_lm_unbias2[3], coeff_multi_lm_unbias3[3]),
+  P_value = c(coeff_multi_lm_bias[4], coeff_multi_lm_unbias[4], coeff_multi_lm_unbias2[4], coeff_multi_lm_unbias3[4])
+)
+
+# Print the results. All unbiased models should yield the exact same estimate.
+print(results_df)
+```
+
+# FWL theorem in the OVB framework
+
+## Traditional OVB framework 
+
+Suppose we want to run a linear regression model of an outcome Y (nx1) on a treatment D (nx1), controlling for a set of covariates X (observed, nxp) and Z (unobserved, nx1). Assume white noise e (nx1).
+
+```{r}
+set.seed(12012023)
+n_obs <- 1000
+n_covariates <- 3
+Z <- runif(n_obs, 0, 1) # some percentage value or rate
+D <- rbinom(n_obs, 1, 0.5)
+X <- matrix(rnorm(n_obs*n_covariates, 4, 1), 
+            nrow=n_obs, ncol=n_covariates)
+e <- rnorm(1000,0,1)
+
+betas <- c(1.2, 4.5, 3)
+  
+# Full model
+Y <- 2.5 + 3*D + X%*%betas + 2*Z + e
+
+# OVB model
+Y_ovb <- 2.5 + 3*D + X%*%betas + e
+
+summary(lm(Y ~ D + Z + X))
+
+summary(lm(Y_ovb ~ D + X))
+```
+
+
+
+```{r}
+# partialing out X
+D_X <- lm(D ~ X)$residuals
+Y_X <- lm(Y ~ X)$residuals
+Z_X <- lm(Z ~ X)$residuals
+
+# estimation
+treat_ovb <- cov(D_X, Y_X) / var(D_X)
+paste("We are under(over) estimating by:", treat_ovb)
+```
+
+
+
+
+
+
+
+
+

@@ -1,0 +1,663 @@
+---
+title: "DiD - Sensitivity Analysis"
+output: html_notebook
+author: "Augusto Gonzalez Bonorino"
+---
+
+
+```{r}
+library(tidyverse)
+library(ggplot2)
+library(MatchIt)
+library(plm)
+library(sandwich)
+library(lmtest)
+library(cobalt)
+```
+
+## General assumption of the Potential Outcomes framework
+
+*Stable Unit Treatment Value Assumption (SUTVA)*: 
+
+- Y_it = Y_it(0) * (1 - D_it) + Y_it(1) * D_it
+- The outcome for any unit does not depend on the treatment status of other units (no interference), and there's only one version of the treatment
+
+*Random Assignment*:
+
+- E[Y_it(1) - Y_it(0)|D_it] = E[Y_it(1) - Y_it(0)]
+- In randomized experiments, treatment assignment is independent of potential outcomes. This ensures unbiased estimation of treatment effects.
+- Not wise to accept it hold in observational data.
+
+## DiD specific assumptions
+
+*Parallel Trends*:
+
+- E[Y_it(0)|Treated] - E[Y_it(0)|Control] = c (difference is constant over time)
+- In the absence of treatment, the average change over time in the outcome variable would have been the same for both the treatment and control groups. This is fundamental for identifying causal effects in DiD.
+
+*Treatment Timing*:
+
+- The treatment effect is assumed to begin at a certain time point and is consistently applied thereafter. Variations in treatment timing can complicate the analysis.
+
+*No Anticipation*:
+
+- E[Y_it(0)|Post] = E[Y_it(0)|Pre] for the treated group
+
+*Consistency in Treatment Effect*
+- Assumes the treatment effect is consistent across different units and time periods. This assumption might not hold if there are heterogeneous effects.
+
+*No Spillover Effects*
+- Assumes that the treatment effect is contained within the treated unit and does not influence the control group. This is crucial for isolating the treatment effect.
+
+
+
+```{r}
+generate_panel_data <- function(n_units = 100, n_time = 10, 
+                               treatment_start_period = 6, 
+                               treatment_effect = 3, 
+                               selection_bias_intensity = 0, 
+                               heterogeneity_intensity = 0, 
+                               time_varying_confounder_intensity = 0, 
+                               trend_difference = 0, 
+                               noise_sd = 1, 
+                               random_seed = NULL) {
+  
+  if (!is.null(random_seed)) {
+    set.seed(random_seed)
+  }
+  
+  # Create basic panel structure
+  panel_data <- expand.grid(unit = 1:n_units, time = 1:n_time)
+  panel_data$post <- panel_data$time >= treatment_start_period
+
+  # Generate observed covariate
+  panel_data$observed_covariate <- rnorm(nrow(panel_data))
+
+  # Generate unobserved heterogeneity
+  unobserved_effects <- rnorm(n_units, mean = 0, sd = heterogeneity_intensity)
+  panel_data$unobserved_effect <- unobserved_effects[panel_data$unit]
+
+  # Generate time-varying confounder
+  # Example: Linear function of time and observed covariate
+  panel_data$time_varying_confounder <- (panel_data$time) * time_varying_confounder_intensity + 
+                                        panel_data$observed_covariate
+
+  # Simulate treatment assignment with selection bias and confounder influence
+  panel_data$treatment <- with(panel_data, as.integer(post & 
+                             (rnorm(n_units, observed_covariate + time_varying_confounder, 
+                             selection_bias_intensity)[unit] > 0)))
+
+  # Define trends for control and treatment groups
+  trend_control <- 2
+  trend_treatment <- trend_control + trend_difference
+
+  # Simulate outcome
+  panel_data$outcome <- with(panel_data, {
+    baseline_outcome <- 50 + 2 * time
+
+    baseline_outcome + 
+    post * (trend_control + trend_difference * treatment) + 
+    treatment * treatment_effect * post +
+    time_varying_confounder +  # Impact of confounder on outcome
+    rnorm(nrow(panel_data), mean = 0, sd = noise_sd)
+  })
+
+  return(panel_data)
+}
+```
+
+
+## Unbiased DiD in balanced panel simulation test
+
+```{r}
+# Parameters for unbiased case
+n_units <- 30
+n_time <- 30
+treatment_start_period <- n_time / 2 # for simplicity I set a pre and post periods of equal length
+treatment_effect <- 5  # Known treatment effect
+selection_bias_intensity <- 0
+heterogeneity_intensity <- 0
+time_varying_confounder_intensity <- 0
+trend_difference <- 0
+noise_sd <- 1
+seed <- 12122023
+
+n_runs <- 50
+
+# Initialize an empty data frame to store results
+results_df <- data.frame(true_effect = numeric(n_runs),
+                         estimate = numeric(n_runs),
+                         difference = numeric(n_runs),
+                         sd_error = numeric(n_runs),
+                         p_value = numeric(n_runs))
+
+for (i in 1:n_runs) {
+  
+  panel_data_test <- generate_panel_data(n_units, n_time, 
+                                         treatment_start_period,
+                                         treatment_effect, 
+                                         selection_bias_intensity,
+                                         heterogeneity_intensity,
+                                         time_varying_confounder_intensity,
+                                         trend_difference, noise_sd)
+  
+  did_model <- plm(outcome ~ treatment * post + observed_covariate, 
+                   data = panel_data_test, 
+                   index = c("unit", "time"),
+                   model = "within")
+  
+  estimate <- summary(did_model)$coefficients[1,1]
+  sd_error <- summary(did_model)$coefficients[1,2]
+  p_value <- summary(did_model)$coefficients[1,4]
+  difference <- estimate - treatment_effect
+  
+  # Append the results of this run to the data frame
+  results_df[i, ] <- c(treatment_effect, estimate, difference, sd_error, p_value)
+}
+
+# Display the results data frame
+print(results_df)
+print(mean(results_df[['difference']]))
+print(mean(results_df[['sd_error']]))
+```
+
+In typical DiD analyses, we are interested in the coefficient of the interaction term between the treatment indicator and the post-treatment time indicator. This interaction captures the incremental effect of the treatment after the treatment has been implemented.
+
+However, in a fixed effects model where each unit receives treatment at the same time, the treatment indicator doesn't vary within units over time. It's either always 0 (for control units) or always 1 (for treated units) across all time periods.
+
+In such cases, the plm function with "within" transformation interprets the treatment variable as the interaction term itself because the treatment effect is only identifiable in the post-treatment periods due to the within-unit differencing. Hence, the coefficient of the treatment variable in the plm output effectively represents the DiD estimator.
+
+```{r}
+ggplot(results_df, aes(x = 1:n_runs, y = estimate)) +
+    geom_line() +
+    geom_point() +
+    geom_errorbar(aes(ymin = estimate - sd_error, ymax = estimate + sd_error), width = 0.1) +
+    theme_minimal() +
+    labs(title = "Unbiased and Balanced Panel DiD Estimates",
+         x = "Number of Runs",
+         y = "Estimated Treatment Effect",
+         caption = "Data from DiD simulation") +
+    theme(plot.title = element_text(hjust = 0.5))
+```
+
+# Unbiased with long panel
+
+```{r}
+# Parameters for unbiased case
+n_units <- 30
+n_time <- 50
+treatment_start_period <- n_time / 2
+treatment_effect <- 5  # Known treatment effect
+selection_bias_intensity <- 0
+heterogeneity_intensity <- 0
+time_varying_confounder_intensity <- 0
+trend_difference <- 0
+noise_sd <- 1
+seed <- 12122023
+
+n_runs <- 50
+
+# Initialize an empty data frame to store results
+results_df_long <- data.frame(true_effect = numeric(n_runs),
+                         estimate = numeric(n_runs),
+                         difference = numeric(n_runs),
+                         sd_error = numeric(n_runs),
+                         p_value = numeric(n_runs))
+
+for (i in 1:n_runs) {
+  
+  panel_data_test <- generate_panel_data(n_units, n_time, 
+                                         treatment_start_period,
+                                         treatment_effect, 
+                                         selection_bias_intensity,
+                                         heterogeneity_intensity,
+                                         time_varying_confounder_intensity,
+                                         trend_difference, noise_sd)
+  
+  did_model <- plm(outcome ~ treatment * post + observed_covariate, 
+                   data = panel_data_test, 
+                   index = c("unit", "time"),
+                   model = "within")
+  
+  estimate <- summary(did_model)$coefficients[1,1]
+  sd_error <- summary(did_model)$coefficients[1,2]
+  p_value <- summary(did_model)$coefficients[1,4]
+  difference <- estimate - treatment_effect
+  
+  # Append the results of this run to the data frame
+  results_df_long[i, ] <- c(treatment_effect, estimate, difference, sd_error, p_value)
+}
+
+# Display the results data frame
+print(results_df_long)
+print(mean(results_df_long[['difference']]))
+print(mean(results_df_long[['sd_error']]))
+```
+
+```{r}
+ggplot(results_df_long, aes(x = 1:n_runs, y = estimate)) +
+    geom_line() +
+    geom_point() +
+    geom_errorbar(aes(ymin = estimate - sd_error, ymax = estimate + sd_error), width = 0.1) +
+    theme_minimal() +
+    labs(title = "Unbiased and Long Panel DiD Estimates",
+         x = "Number of Runs",
+         y = "Estimated Treatment Effect",
+         caption = "Data from DiD simulation") +
+    theme(plot.title = element_text(hjust = 0.5))
+```
+
+# Unbiased for short panel
+
+```{r}
+# Parameters for unbiased case
+n_units <- 50
+n_time <- 30
+treatment_start_period <- n_time / 2
+treatment_effect <- 5  # Known treatment effect
+selection_bias_intensity <- 0
+heterogeneity_intensity <- 0
+time_varying_confounder_intensity <- 0
+trend_difference <- 0
+noise_sd <- 1
+seed <- 12122023
+
+n_runs <- 50
+
+# Initialize an empty data frame to store results
+results_df_short <- data.frame(true_effect = numeric(n_runs),
+                         estimate = numeric(n_runs),
+                         difference = numeric(n_runs),
+                         sd_error = numeric(n_runs),
+                         p_value = numeric(n_runs))
+
+for (i in 1:n_runs) {
+  
+  panel_data_test <- generate_panel_data(n_units, n_time, 
+                                         treatment_start_period,
+                                         treatment_effect, 
+                                         selection_bias_intensity,
+                                         heterogeneity_intensity,
+                                         time_varying_confounder_intensity,
+                                         trend_difference, noise_sd)
+  
+  did_model <- plm(outcome ~ treatment * post + observed_covariate, 
+                   data = panel_data_test, 
+                   index = c("unit", "time"),
+                   model = "within")
+  
+  estimate <- summary(did_model)$coefficients[1,1]
+  sd_error <- summary(did_model)$coefficients[1,2]
+  p_value <- summary(did_model)$coefficients[1,4]
+  difference <- estimate - treatment_effect
+  
+  # Append the results of this run to the data frame
+  results_df_short[i, ] <- c(treatment_effect, estimate, difference, sd_error, p_value)
+}
+
+# Display the results data frame
+print(results_df_short)
+print(mean(results_df_short[['difference']]))
+print(mean(results_df_short[['sd_error']]))
+```
+
+```{r}
+ggplot(results_df_short, aes(x = 1:n_runs, y = estimate)) +
+    geom_line() +
+    geom_point() +
+    geom_errorbar(aes(ymin = estimate - sd_error, ymax = estimate + sd_error), width = 0.1) +
+    theme_minimal() +
+    labs(title = "Unbiased and Short Panel DiD Estimates",
+         x = "Number of Runs",
+         y = "Estimated Treatment Effect",
+         caption = "Data from DiD simulation") +
+    theme(plot.title = element_text(hjust = 0.5))
+```
+
+# Biased DiD experiments
+
+
+## Selection bias
+
+Selection bias typically refers to the scenario where the assignment of the treatment is not random and may be correlated with other factors that also affect the outcome.
+
+From the literature, we know that:
+
+DiD is often considered robust to selection bias, especially biases that are time-invariant, because it inherently controls for all time-invariant unobserved heterogeneity. However, if the process of selection into treatment changes over time in ways correlated with the outcome, this can violate the parallel trends assumption, leading to biased estimates.
+
+For example, if more capable units (e.g., more productive firms, healthier individuals) are more likely to receive treatment over time, and this capability also affects the outcome, DiD estimates can be biased.
+
+hypothesis: Introducing selection bias, where treatment assignment is correlated with an observed covariate, will slightly alter the DiD estimates, but the effect will be relatively modest due to DiD's robustness to time-invariant selection biases.
+
+
+```{r}
+# Simulation parameters
+n_units <- 30
+n_time <- 30
+treatment_start_period <- n_time / 2
+treatment_effect <- 5
+selection_biases <- seq(0, 50, by = 0.5) # Range of selection bias intensities
+heterogeneity_intensity <- 0
+time_varying_confounder_intensity <- 0
+trend_difference <- 0
+noise_sd <- 1
+
+
+
+# Initialize an empty data frame to store results
+results_df_bias <- data.frame(bias_intensity = numeric(),
+                             estimate = numeric(),
+                             difference = numeric(),
+                             sd_error = numeric(),
+                             p_value = numeric())
+
+# Run simulations
+for (bias in selection_biases) {
+  panel_data_test <- generate_panel_data(n_units, n_time, 
+                                         treatment_start_period, treatment_effect, 
+                                         bias, heterogeneity_intensity, 
+                                         time_varying_confounder_intensity, 
+                                         trend_difference, noise_sd)
+
+  did_model <- plm(outcome ~ treatment * post + observed_covariate, 
+                   data = panel_data_test, 
+                   index = c("unit", "time"),
+                   model = "within")
+
+  estimate <- summary(did_model)$coefficients[1,1]
+  sd_error <- summary(did_model)$coefficients[1,2]
+  p_value <- summary(did_model)$coefficients[1,4]
+  difference <- estimate - treatment_effect
+
+  # Create a new data frame for this run's results
+  run_results_df <- data.frame(bias_intensity = bias,
+                               estimate = estimate,
+                               difference = difference,
+                               sd_error = sd_error,
+                               p_value = p_value)
+
+  # Append the results of this run to the main results data frame
+  results_df_bias <- rbind(results_df_bias, run_results_df)
+}
+
+# Display the results data frame
+print(results_df_bias)
+print(mean(results_df_bias[['difference']]))
+print(mean(results_df_bias[['sd_error']]))
+```
+
+```{r}
+ggplot(results_df_bias, aes(x = bias_intensity, y = estimate)) +
+    geom_line() +
+    geom_point() +
+    geom_errorbar(aes(ymin = estimate - sd_error, ymax = estimate + sd_error), width = 0.1) +
+    theme_minimal() +
+    labs(title = "Impact of Selection Bias on DiD Estimates",
+         x = "Selection Bias",
+         y = "Estimated Treatment Effect",
+         caption = "Data from DiD simulation") +
+    theme(plot.title = element_text(hjust = 0.5))
+```
+
+
+## Time-varying confounders
+
+Time-varying confounders can lead to biased DiD estimates, especially if these confounders are correlated with both the treatment and the outcome. The literature suggests that failing to control for such confounders can result in overestimating or underestimating the treatment effect.
+
+hypothesis: Introducing time-varying confounders that are correlated with both the treatment and the outcome will lead to significant deviations in DiD estimates, potentially biasing them upwards or downwards depending on the nature of the confounder
+
+
+```{r}
+# Simulation parameters
+n_units <- 30
+n_time <- 30
+treatment_start_period <- n_time / 2
+treatment_effect <- 5
+selection_biases <- 0
+heterogeneity_intensity <- 0
+time_varying_confounder_intensity <- seq(0, 50, by = 0.5) # Define a range for time-varying confounder intensity
+trend_difference <- 0
+noise_sd <- 1
+
+
+# Initialize a data frame for results
+results_df_confounder <- data.frame(confounder_intensity = numeric(),
+                                    estimate = numeric(),
+                                    difference = numeric(),
+                                    sd_error = numeric(),
+                                    p_value = numeric())
+
+# Run simulations
+for (confounder_intensity in time_varying_confounder_intensity) {
+  panel_data_test <- generate_panel_data(n_units, n_time, 
+                                         treatment_start_period, treatment_effect, 
+                                         selection_bias_intensity = 0, 
+                                         heterogeneity_intensity = 0, 
+                                         time_varying_confounder_intensity = confounder_intensity, 
+                                         trend_difference, noise_sd)
+
+  did_model <- plm(outcome ~ treatment * post + observed_covariate + time_varying_confounder, 
+                   data = panel_data_test, 
+                   index = c("unit", "time"),
+                   model = "within")
+
+  estimate <- summary(did_model)$coefficients[1,1]
+  sd_error <- summary(did_model)$coefficients[1,2]
+  p_value <- summary(did_model)$coefficients[1,4]
+  difference <- estimate - treatment_effect
+
+  # Append results
+  run_results_df <- data.frame(confounder_intensity = confounder_intensity,
+                               estimate = estimate,
+                               difference = difference,
+                               sd_error = sd_error,
+                               p_value = p_value)
+
+  results_df_confounder <- rbind(results_df_confounder, run_results_df)
+}
+
+# Print results
+print(results_df_confounder)
+print(mean(results_df_confounder[['difference']]))
+print(mean(results_df_confounder[['sd_error']]))
+```
+
+```{r}
+ggplot(results_df_confounder, aes(x = time_varying_confounder_intensity, y = estimate)) +
+    geom_line() +
+    geom_point() +
+    geom_errorbar(aes(ymin = estimate - sd_error, ymax = estimate + sd_error), width = 0.1) +
+    theme_minimal() +
+    labs(title = "Impact of Time-Varying Confounder Bias on DiD Estimates",
+         x = "Time-Varying Confounder Bias",
+         y = "Estimated Treatment Effect",
+         caption = "Data from DiD simulation") +
+    theme(plot.title = element_text(hjust = 0.5))
+```
+
+
+## Parallel trends
+
+```{r}
+# Simulation parameters
+n_units <- 30
+n_time <- 30
+treatment_start_period <- n_time / 2
+treatment_effect <- 5
+selection_biases <- 0
+heterogeneity_intensity <- 0
+time_varying_confounder_intensity <- 0
+trend_differences <- seq(0, 50, by = 0.5) # Define a range for trend differences
+noise_sd <- 1
+
+
+# Initialize a data frame for results
+results_df_trends <- data.frame(trend_difference = numeric(),
+                                estimate = numeric(),
+                                difference = numeric(),
+                                sd_error = numeric(),
+                                p_value = numeric())
+
+# Run simulations
+for (trend_diff in trend_differences) {
+  panel_data_test <- generate_panel_data(n_units, n_time, 
+                                         treatment_start_period, treatment_effect, 
+                                         selection_bias_intensity = 0, 
+                                         heterogeneity_intensity = 0, 
+                                         time_varying_confounder_intensity = 0, 
+                                         trend_difference = trend_diff, 
+                                         noise_sd)
+
+  did_model <- plm(outcome ~ treatment * post + observed_covariate, 
+                   data = panel_data_test, 
+                   index = c("unit", "time"),
+                   model = "within")
+
+  estimate <- summary(did_model)$coefficients[1,1]
+  sd_error <- summary(did_model)$coefficients[1,2]
+  p_value <- summary(did_model)$coefficients[1,4]
+  difference <- estimate - treatment_effect
+
+  # Append results
+  run_results_df <- data.frame(trend_difference = trend_diff,
+                               estimate = estimate,
+                               difference = difference,
+                               sd_error = sd_error,
+                               p_value = p_value)
+
+  results_df_trends <- rbind(results_df_trends, run_results_df)
+}
+
+# Print results
+print(results_df_trends)
+print(mean(results_df_trends[['difference']]))
+print(mean(results_df_trends[['sd_error']]))
+```
+
+```{r}
+ggplot(results_df_trends, aes(x = trend_difference, y = estimate)) +
+  geom_line() +
+  geom_point() +
+  geom_errorbar(aes(ymin = estimate - sd_error, ymax = estimate + sd_error), width = 0.1) +
+  theme_minimal() +
+  labs(title = "Impact of Trend Differences on DiD Estimates",
+       x = "Trend Difference",
+       y = "Estimated Treatment Effect",
+       caption = "Data from DiD simulation") +
+  theme(plot.title = element_text(hjust = 0.5))
+
+```
+
+# Heterogeneity
+
+```{r}
+# Simulation parameters
+n_units <- 30
+n_time <- 30
+treatment_start_period <- n_time / 2
+treatment_effect <- 5
+selection_bias <- 0
+heterogeneity_intensities <- seq(0, 50, by = 0.5) # Define a range for heterogeneity intensity
+time_varying_confounder_intensity <- 0 
+trend_difference <- 0
+noise_sd <- 1
+
+
+# Initialize a data frame for results
+results_df_het <- data.frame(confounder_intensity = numeric(),
+                                    estimate = numeric(),
+                                    difference = numeric(),
+                                    sd_error = numeric(),
+                                    p_value = numeric())
+
+# Run simulations
+for (heterogeneity_intensity in heterogeneity_intensities) {
+  panel_data_test <- generate_panel_data(n_units, n_time, 
+                                         treatment_start_period, treatment_effect, 
+                                         selection_bias_intensity = 0, 
+                                         heterogeneity_intensity = heterogeneity_intensity, 
+                                         time_varying_confounder_intensity = 0, 
+                                         trend_difference, noise_sd)
+
+  did_model <- plm(outcome ~ treatment * post + observed_covariate, 
+                   data = panel_data_test, 
+                   index = c("unit", "time"),
+                   model = "within")
+
+  estimate <- summary(did_model)$coefficients[1,1]
+  sd_error <- summary(did_model)$coefficients[1,2]
+  p_value <- summary(did_model)$coefficients[1,4]
+  difference <- estimate - treatment_effect
+
+  # Append results
+  run_results_df <- data.frame(heterogeneity_intensity = heterogeneity_intensity,
+                               estimate = estimate,
+                               difference = difference,
+                               sd_error = sd_error,
+                               p_value = p_value)
+
+  results_df_het <- rbind(results_df_het, run_results_df)
+}
+
+# Print results
+print(results_df_het)
+print(mean(results_df_het[['difference']]))
+print(mean(results_df_het[['sd_error']]))
+```
+
+```{r}
+ggplot(results_df_het, aes(x = heterogeneity_intensity, y = estimate)) +
+  geom_line() +
+  geom_point() +
+  geom_errorbar(aes(ymin = estimate - sd_error, ymax = estimate + sd_error), width = 0.1) +
+  theme_minimal() +
+  labs(title = "Impact of Unit Heterogeneity on DiD Estimates",
+       x = "Heterogeneity Intensity",
+       y = "Estimated Treatment Effect",
+       caption = "Data from DiD simulation") +
+  theme(plot.title = element_text(hjust = 0.5))
+```
+
+# Results
+
+```{r}
+generate_latex_table <- function(results_list, names_list) {
+  # Start the LaTeX table
+  latex_table <- "\\begin{table}[h]\n\\centering\n\\begin{tabular}{|l|c|c|c|}\n"
+  latex_table <- paste(latex_table, "\\hline\n", sep="")
+  latex_table <- paste(latex_table, "Experiment & Mean Estimate & Mean Difference & Mean Std. Error & Mean P-value \\\\\n\\hline\n", sep="")
+
+  # Loop through the list of result dataframes
+  for (i in seq_along(results_list)) {
+    df <- results_list[[i]]
+    name <- names_list[i]
+
+    mean_estimate <- mean(df$estimate, na.rm = TRUE)
+    mean_diff <- mean(df$difference, na.rm = TRUE)
+    mean_sd_error <- mean(df$sd_error, na.rm = TRUE)
+    mean_pval <- mean(df$p_value, na.rm=TRUE)
+
+    # Add a row to the LaTeX table for each dataframe
+    latex_table <- paste(latex_table, sprintf("%s & %.3f & %.3f & %.3f & %.3f \\\\\n", name, mean_estimate, mean_diff, mean_sd_error, mean_pval), sep="")
+  }
+
+  # End the LaTeX table
+  latex_table <- paste(latex_table, "\\hline\n\\end{tabular}\n", sep="")
+  latex_table <- paste(latex_table, "\\caption{Summary of Experiment Results}\n", sep="")
+  latex_table <- paste(latex_table, "\\label{tab:experiment_results}\n\\end{table}", sep="")
+
+  return(latex_table)
+}
+
+# Example usage:
+results_list <- list(results_df, results_df_long, results_df_short, 
+                     results_df_bias, results_df_confounder, 
+                     results_df_trends, results_df_het)
+names_list <- c("Unbiased Balanced Panel", "Unbiased Long Panel", 
+                "Unbiased Short Panel", "Selection Bias", "Time-Varying Confounders", 
+                "Parallel Trends", "Heterogeneity Bias")
+latex_table_code <- generate_latex_table(results_list, names_list)
+cat(latex_table_code)
+
+```
+
